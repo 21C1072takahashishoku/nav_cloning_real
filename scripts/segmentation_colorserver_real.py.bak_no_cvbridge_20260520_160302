@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Generated real-robot integration version. Original source: simulation/scripts/segmentation_colorserver.py
+"""
+Mask2Former segmentation server for real-robot ROS Noetic 4ch nav_cloning.
+
+Purpose:
+    - Subscribe synchronized 3-camera RGB images.
+    - Run Mask2Former ADE20K once per synchronized set.
+    - Publish 48x64 mono8 ground masks for existing 4ch nav_cloning nodes.
+    - Optionally publish pred_id mono16 images.
+    - Optionally save pred_id, pred_color, full-size mask, and 48x64 mask.
+
+Output mask definition:
+    ground     = 255
+    non-ground = 0
+
+Environment:
+    conda activate mask2former_mmseg
+"""
+
+import os
+from datetime import datetime
+
+import cv2
+import numpy as np
+import rospy
+import torch
+import message_filters
+
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
+from std_srvs.srv import Trigger, TriggerResponse
+from mmseg.apis import init_model, inference_model
+
+
+class SegmentationServer:
+    # ===== Topics =====
+    DEFAULT_IN_CENTER_TOPIC = "/camera_center/usb_cam/image_raw"
+    DEFAULT_IN_LEFT_TOPIC   = "/camera_left/usb_cam/image_raw"
+    DEFAULT_IN_RIGHT_TOPIC  = "/camera_right/usb_cam/image_raw"
+
+    DEFAULT_OUT_MASK_CENTER_TOPIC = "/segmentation/ground_mask_center"
+    DEFAULT_OUT_MASK_LEFT_TOPIC   = "/segmentation/ground_mask_left"
+    DEFAULT_OUT_MASK_RIGHT_TOPIC  = "/segmentation/ground_mask_right"
+
+    DEFAULT_OUT_ID_CENTER_TOPIC = "/segmentation/pred_id_center"
+    DEFAULT_OUT_ID_LEFT_TOPIC   = "/segmentation/pred_id_left"
+    DEFAULT_OUT_ID_RIGHT_TOPIC  = "/segmentation/pred_id_right"
+
+    # ===== Mask2Former =====
+    DEFAULT_CFG = (
+        "/home/orne_beta/mask2former_project/mmsegmentation/"
+        "configs/mask2former/mask2former_swin-s_8xb2-160k_ade20k-512x512.py"
+    )
+    DEFAULT_CKPT = "/home/orne_beta/mask2former_project/checkpoints/mask2former_swin-s_ade20k.pth"
+
+    def __init__(self):
+        rospy.init_node("segmentation_colorserver", anonymous=False)
+        self.bridge = CvBridge()
+
+        # ===== Params =====
+        self.in_center_topic = rospy.get_param("~in_center_topic", self.DEFAULT_IN_CENTER_TOPIC)
+        self.in_left_topic   = rospy.get_param("~in_left_topic",   self.DEFAULT_IN_LEFT_TOPIC)
+        self.in_right_topic  = rospy.get_param("~in_right_topic",  self.DEFAULT_IN_RIGHT_TOPIC)
+
+        self.out_mask_center_topic = rospy.get_param("~out_mask_center_topic", self.DEFAULT_OUT_MASK_CENTER_TOPIC)
+        self.out_mask_left_topic   = rospy.get_param("~out_mask_left_topic",   self.DEFAULT_OUT_MASK_LEFT_TOPIC)
+        self.out_mask_right_topic  = rospy.get_param("~out_mask_right_topic",  self.DEFAULT_OUT_MASK_RIGHT_TOPIC)
+
+        self.out_id_center_topic = rospy.get_param("~out_pred_id_center_topic", self.DEFAULT_OUT_ID_CENTER_TOPIC)
+        self.out_id_left_topic   = rospy.get_param("~out_pred_id_left_topic",   self.DEFAULT_OUT_ID_LEFT_TOPIC)
+        self.out_id_right_topic  = rospy.get_param("~out_pred_id_right_topic",  self.DEFAULT_OUT_ID_RIGHT_TOPIC)
+
+        self.cfg_path = rospy.get_param("~cfg", self.DEFAULT_CFG)
+        self.ckpt_path = rospy.get_param("~ckpt", self.DEFAULT_CKPT)
+        self.device = rospy.get_param("~device", "cuda:0")
+
+        self.scale_h = int(rospy.get_param("~scale_h", 48))
+        self.scale_w = int(rospy.get_param("~scale_w", 64))
+        self.rate_hz = float(rospy.get_param("~rate_hz", 2.0))
+        self.sync_slop_sec = float(rospy.get_param("~sync_slop_sec", 0.05))
+        self.sync_queue = int(rospy.get_param("~sync_queue", 10))
+        self.warmup_iters = int(rospy.get_param("~warmup_iters", 1))
+
+        ground_names_param = rospy.get_param("~ground_names", "floor,road,sidewalk,path,earth,land,field,sand,grass,runway")
+        self.ground_names = {x.strip().lower() for x in str(ground_names_param).split(",") if x.strip()}
+
+        self.publish_pred_id = bool(rospy.get_param("~publish_pred_id", True))
+        self.save_pred = bool(rospy.get_param("~save_pred", True))
+        self.save_pred_interval = int(rospy.get_param("~save_pred_interval", 1))
+        self.save_root = rospy.get_param(
+            "~save_root",
+            "/home/orne_beta/mask2former_project/outputs/ros_mask2former_colorserver",
+        )
+
+        # ===== Check files =====
+        if not os.path.exists(self.cfg_path):
+            raise FileNotFoundError(f"[segmentation_colorserver] config not found: {self.cfg_path}")
+        if not os.path.exists(self.ckpt_path):
+            raise FileNotFoundError(f"[segmentation_colorserver] checkpoint not found: {self.ckpt_path}")
+
+        # ===== Model =====
+        rospy.loginfo("[segmentation_colorserver] loading Mask2Former cfg: %s", self.cfg_path)
+        rospy.loginfo("[segmentation_colorserver] loading checkpoint: %s", self.ckpt_path)
+        self.model = init_model(self.cfg_path, self.ckpt_path, device=self.device)
+        self.model.eval()
+
+        meta = getattr(self.model, "dataset_meta", {}) or {}
+        classes = meta.get("classes") or meta.get("CLASSES")
+        palette = meta.get("palette") or meta.get("PALETTE")
+        if classes is None:
+            raise RuntimeError("[segmentation_colorserver] model.dataset_meta['classes'] not found")
+        self.classes = list(classes)
+        self.palette = [tuple(map(int, p[:3])) for p in palette] if palette is not None else self._fallback_palette(len(self.classes))
+        self.num_classes = max(len(self.classes), 256)
+        self.color_lut = self._build_color_lut(self.num_classes)
+
+        name2id = {str(name).lower(): idx for idx, name in enumerate(self.classes)}
+        self.ground_ids = np.array([name2id[n] for n in self.ground_names if n in name2id], dtype=np.int32)
+        unknown = sorted([n for n in self.ground_names if n not in name2id])
+        if unknown:
+            rospy.logwarn("[segmentation_colorserver] unknown ground names: %s", unknown)
+        if len(self.ground_ids) == 0:
+            raise RuntimeError("[segmentation_colorserver] ground_ids is empty. Check ~ground_names.")
+
+        rospy.loginfo("[segmentation_colorserver] model loaded. ground_names=%s ground_ids=%s",
+                      sorted(self.ground_names), self.ground_ids.tolist())
+
+        # ===== Publishers =====
+        self.pub_mask_center = rospy.Publisher(self.out_mask_center_topic, Image, queue_size=1)
+        self.pub_mask_left   = rospy.Publisher(self.out_mask_left_topic,   Image, queue_size=1)
+        self.pub_mask_right  = rospy.Publisher(self.out_mask_right_topic,  Image, queue_size=1)
+
+        if self.publish_pred_id:
+            self.pub_id_center = rospy.Publisher(self.out_id_center_topic, Image, queue_size=1)
+            self.pub_id_left   = rospy.Publisher(self.out_id_left_topic,   Image, queue_size=1)
+            self.pub_id_right  = rospy.Publisher(self.out_id_right_topic,  Image, queue_size=1)
+
+        rospy.Service("/segmentation/warmup", Trigger, self._srv_warmup)
+
+        self.min_period = rospy.Duration(1.0 / max(0.1, self.rate_hz))
+        self.last_pub_sync = rospy.Time(0)
+        self.frame_counter = 0
+
+        # ===== Save dirs =====
+        if self.save_pred:
+            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            self.run_root = os.path.join(self.save_root, ts)
+            self.save_dir_id = {c: os.path.join(self.run_root, "pred_id", c) for c in ["center", "left", "right"]}
+            self.save_dir_color = {c: os.path.join(self.run_root, "pred_color", c) for c in ["center", "left", "right"]}
+            self.save_dir_mask_full = {c: os.path.join(self.run_root, "mask_full", c) for c in ["center", "left", "right"]}
+            self.save_dir_mask_small = {c: os.path.join(self.run_root, "mask_48x64", c) for c in ["center", "left", "right"]}
+            for d in (list(self.save_dir_id.values()) + list(self.save_dir_color.values()) +
+                      list(self.save_dir_mask_full.values()) + list(self.save_dir_mask_small.values())):
+                os.makedirs(d, exist_ok=True)
+            rospy.loginfo("[segmentation_colorserver] save enabled: %s", self.run_root)
+
+        # ===== 3 cam sync =====
+        sub_c = message_filters.Subscriber(self.in_center_topic, Image)
+        sub_l = message_filters.Subscriber(self.in_left_topic, Image)
+        sub_r = message_filters.Subscriber(self.in_right_topic, Image)
+        self.sync = message_filters.ApproximateTimeSynchronizer(
+            [sub_c, sub_l, sub_r], queue_size=self.sync_queue, slop=self.sync_slop_sec
+        )
+        self.sync.registerCallback(self._cb_sync_3cam)
+
+        if self.warmup_iters > 0:
+            self._warmup(self.warmup_iters)
+
+        rospy.on_shutdown(self._on_shutdown)
+        rospy.loginfo("[segmentation_colorserver] ready. ground=255, non-ground=0, mask=%dx%d", self.scale_w, self.scale_h)
+
+    def _fallback_palette(self, n):
+        rng = np.random.default_rng(1234)
+        return [tuple(map(int, x)) for x in rng.integers(0, 256, size=(n, 3), dtype=np.uint8)]
+
+    def _build_color_lut(self, n):
+        lut = np.zeros((n, 3), dtype=np.uint8)
+        for i in range(min(n, len(self.palette))):
+            lut[i] = np.array(self.palette[i], dtype=np.uint8)  # RGB
+        return lut
+
+    def _colorize_id(self, pred_id_hw: np.ndarray) -> np.ndarray:
+        pid = np.clip(pred_id_hw.astype(np.int32), 0, self.num_classes - 1)
+        rgb = self.color_lut[pid]
+        return rgb[..., ::-1].copy()  # BGR for cv2.imwrite
+
+    def _on_shutdown(self):
+        rospy.loginfo("[segmentation_colorserver] shutdown")
+
+    def _srv_warmup(self, _req):
+        self._warmup(max(1, self.warmup_iters))
+        return TriggerResponse(success=True, message="warmed")
+
+    @torch.no_grad()
+    def _warmup(self, iters: int):
+        dummy_bgr = np.zeros((240, 320, 3), dtype=np.uint8)
+        for _ in range(iters):
+            _ = self._infer_pred(dummy_bgr)
+        rospy.loginfo("[segmentation_colorserver] warmup done. iters=%d", iters)
+
+    def _maybe_save_all(self, cam: str, pred_id_hw: np.ndarray, mask_full: np.ndarray, mask_small: np.ndarray, stamp_ns: int):
+        if not self.save_pred:
+            return
+        if self.save_pred_interval > 1 and (self.frame_counter % self.save_pred_interval) != 0:
+            return
+        fn = f"{stamp_ns}.png"
+        cv2.imwrite(os.path.join(self.save_dir_id[cam], f"pred_id_{fn}"), pred_id_hw.astype(np.uint16))
+        cv2.imwrite(os.path.join(self.save_dir_color[cam], f"pred_color_{fn}"), self._colorize_id(pred_id_hw))
+        cv2.imwrite(os.path.join(self.save_dir_mask_full[cam], f"mask_full_{fn}"), mask_full)
+        cv2.imwrite(os.path.join(self.save_dir_mask_small[cam], f"mask_48x64_{fn}"), mask_small)
+
+    @torch.no_grad()
+    def _cb_sync_3cam(self, msg_c: Image, msg_l: Image, msg_r: Image):
+        now = rospy.Time.now()
+        if now - self.last_pub_sync < self.min_period:
+            return
+        self.last_pub_sync = now
+        self.frame_counter += 1
+
+        common_stamp = msg_c.header.stamp
+        stamp_ns = common_stamp.to_nsec()
+
+        out_c, id_c = self._process_one(msg_c, "center", stamp_ns, common_stamp)
+        out_l, id_l = self._process_one(msg_l, "left",   stamp_ns, common_stamp)
+        out_r, id_r = self._process_one(msg_r, "right",  stamp_ns, common_stamp)
+
+        if out_c is not None:
+            self.pub_mask_center.publish(out_c)
+            if self.publish_pred_id and id_c is not None:
+                self.pub_id_center.publish(id_c)
+        if out_l is not None:
+            self.pub_mask_left.publish(out_l)
+            if self.publish_pred_id and id_l is not None:
+                self.pub_id_left.publish(id_l)
+        if out_r is not None:
+            self.pub_mask_right.publish(out_r)
+            if self.publish_pred_id and id_r is not None:
+                self.pub_id_right.publish(id_r)
+
+    def _process_one(self, msg: Image, cam: str, stamp_ns: int, common_stamp):
+        try:
+            bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as e:
+            rospy.logwarn_throttle(2.0, "[segmentation_colorserver] cv_bridge fail [%s]: %s", cam, e)
+            return None, None
+        if bgr is None or bgr.size == 0:
+            rospy.logwarn_throttle(2.0, "[segmentation_colorserver] empty frame [%s]", cam)
+            return None, None
+        try:
+            pred = self._infer_pred(bgr)
+        except Exception as e:
+            rospy.logerr_throttle(2.0, "[segmentation_colorserver] infer failed [%s]: %s", cam, e)
+            return None, None
+
+        mask_full = np.where(np.isin(pred, self.ground_ids), 255, 0).astype(np.uint8)
+        mask_small = cv2.resize(mask_full, (self.scale_w, self.scale_h), interpolation=cv2.INTER_NEAREST)
+        self._maybe_save_all(cam, pred, mask_full, mask_small, stamp_ns)
+
+        mask_msg = self.bridge.cv2_to_imgmsg(mask_small, encoding="mono8")
+        mask_msg.header = msg.header
+        mask_msg.header.stamp = common_stamp
+
+        id_msg = None
+        if self.publish_pred_id:
+            id_msg = self.bridge.cv2_to_imgmsg(pred.astype(np.uint16), encoding="mono16")
+            id_msg.header = msg.header
+            id_msg.header.stamp = common_stamp
+
+        rospy.loginfo_throttle(2.0, "[segmentation_colorserver] %s ground_ratio=%.3f", cam, float(np.mean(mask_small == 255)))
+        return mask_msg, id_msg
+
+    @torch.no_grad()
+    def _infer_pred(self, bgr_uint8: np.ndarray) -> np.ndarray:
+        result = inference_model(self.model, bgr_uint8)
+        data = result.pred_sem_seg.data
+        if isinstance(data, torch.Tensor):
+            arr = data.detach().cpu().numpy()
+        else:
+            arr = np.asarray(data)
+        if arr.ndim == 3:
+            arr = arr[0]
+        if arr.ndim != 2:
+            raise ValueError(f"Unexpected pred shape: {arr.shape}")
+        return arr.astype(np.int32, copy=False)
+
+
+def main():
+    SegmentationServer()
+    rospy.spin()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="script2" default="nav_cloning_node.py"/>
+    <node pkg="nav_cloning" type="$(arg script2)" name="nav_cloning_node2" output="screen"/>
+</launch>

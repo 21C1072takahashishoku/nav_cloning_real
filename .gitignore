@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+#自分で新たに追加これ以降
+# データ：dataディレクトリ自体は残し、中身だけ除外
+/data/*
+
+# augmix：augmix本体を除外
+/augmix

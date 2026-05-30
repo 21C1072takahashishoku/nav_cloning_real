@@ -1,0 +1,102 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="script" default="nav_cloning_node.py"/>
+  <!-- <arg name="script2" default="nav_cloning_node_pytorch_plot2_willow_50_corner.py"/> -->
+  <arg name="map_file" default="willowgarage.yaml"/>
+  <arg name="mode" default="change_dataset_balance"/>
+  <arg name="save_offline_dataset" default="true"/>
+  <arg name="dataset_id" default=""/>
+  <arg name="dataset_stride" default="1"/>
+  <arg name="dataset_action_offset" default="0.2"/>
+  <arg name="train_steps" default="10000"/>
+  <arg name="test_steps" default="3000"/>
+  <arg name="auto_stop_test" default="false"/>
+  <arg name="auto_save_model" default="true"/>
+  <arg name="auto_load_model" default="true"/>
+  <!-- <arg name="dist_err" default="0.8"/> -->
+  <arg name="use_waypoint_nav" default="false"/>
+  <arg name="waypoints_file" default="cit3f_way.yaml"/>
+  <arg name="dist_err" default="1.0"/>
+  <arg name="waypoint_server_config" default="$(find waypoint_server)/config/waypoint_server.yaml"/>
+  <arg name="use_dynamic_inflation" default="false"/>
+  <arg name="inflation_mode" default="count"/>
+  <arg name="inflation_wp_small" default="10"/>
+  <arg name="inflation_wp_large" default="15"/>
+  <arg name="inflation_index_small" default="10"/>
+  <arg name="inflation_index_large" default="0"/>
+  <arg name="inflation_small" default="0.2"/>
+  <arg name="inflation_large" default="0.6"/>
+  <arg name="inflation_topic" default="/waypoint_manager/waypoint/is_reached"/>
+  <arg name="inflation_waypoint_topic" default="/waypoint_manager/waypoint"/>
+  <arg name="inflation_identity_regex" default="^wp_(\d+)$"/>
+  <arg name="initial_pose_x" default="-10.78" />
+  <arg name="initial_pose_y" default="-16.78" />
+  <arg name="initial_pose_a" default="0.0" />
+  <arg name="use_initpose" default="false" />
+  <arg name="robot_x" default="0.0" />
+  <arg name="robot_y" default="0.0" />
+  <arg name="robot_Y" default="0.0" />
+
+
+   <param name="/nav_cloning_node/mode" value="$(arg mode)" type="str"/>
+   <param name="/nav_cloning_node/save_offline_dataset" value="$(arg save_offline_dataset)" type="bool"/>
+   <param name="/nav_cloning_node/dataset_id" value="$(arg dataset_id)" type="str"/>
+   <param name="/nav_cloning_node/dataset_stride" value="$(arg dataset_stride)" type="int"/>
+   <param name="/nav_cloning_node/dataset_action_offset" value="$(arg dataset_action_offset)" type="double"/>
+   <param name="/nav_cloning_node/train_steps" value="$(arg train_steps)" type="int"/>
+   <param name="/nav_cloning_node/test_steps" value="$(arg test_steps)" type="int"/>
+   <param name="/nav_cloning_node/auto_stop_test" value="$(arg auto_stop_test)" type="bool"/>
+   <param name="/nav_cloning_node/auto_save_model" value="$(arg auto_save_model)" type="bool"/>
+   <param name="/nav_cloning_node/auto_load_model" value="$(arg auto_load_model)" type="bool"/>
+
+
+
+  <group if="$(arg use_initpose)">
+    <node pkg="nav_cloning" type="initpose" name="initpose"/>
+  </group>
+
+  <node pkg="timed_roslaunch" type="timed_roslaunch.sh"
+        args="5 nav_cloning nav_cloning.launch script:=$(arg script)"
+        name="timed_roslaunch" output="screen" />
+
+  <!-- <node pkg="timed_roslaunch" type="timed_roslaunch.sh"
+        args="60 nav_cloning nav_cloning2.launch script2:=$(arg script2)"
+        name="timed_roslaunch2" output="screen" /> -->
+
+  <node pkg="timed_roslaunch" type="timed_roslaunch.sh"
+        args="10 orne_navigation_executor play_waypoints_nav_common.launch
+        map_file:=$(find nav_cloning)/maps/$(arg map_file)
+        use_waypoint_nav:=$(arg use_waypoint_nav)
+        waypoints_file:=$(find nav_cloning)/maps/$(arg waypoints_file)
+        dist_err:=$(arg dist_err)
+        waypoint_server_config:=$(arg waypoint_server_config)
+        initial_pose_x:=$(arg initial_pose_x) 
+        initial_pose_y:=$(arg initial_pose_y) 
+        initial_pose_a:=$(arg initial_pose_a)"
+        name="timed_roslaunch2" output="screen">
+  </node>
+
+  <group if="$(arg use_dynamic_inflation)">
+    <node pkg="nav_cloning" type="waypoint_inflation_switcher.py"
+          name="waypoint_inflation_switcher" output="screen">
+      <param name="mode" value="$(arg inflation_mode)"/>
+      <param name="topic" value="$(arg inflation_topic)"/>
+      <param name="waypoint_topic" value="$(arg inflation_waypoint_topic)"/>
+      <param name="wp_small" value="$(arg inflation_wp_small)"/>
+      <param name="wp_large" value="$(arg inflation_wp_large)"/>
+      <param name="index_small" value="$(arg inflation_index_small)"/>
+      <param name="index_large" value="$(arg inflation_index_large)"/>
+      <param name="identity_regex" value="$(arg inflation_identity_regex)"/>
+      <param name="radius_small" value="$(arg inflation_small)"/>
+      <param name="radius_large" value="$(arg inflation_large)"/>
+    </node>
+  </group>
+
+   <group unless="$(arg use_waypoint_nav)">
+    <node pkg="timed_roslaunch" type="timed_roslaunch.sh"
+          args="30 nav_cloning start_manager_nav.launch"
+          name="timed_roslaunch3" >
+    </node>
+   </group>
+
+</launch>

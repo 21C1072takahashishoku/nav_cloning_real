@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Minimal launch for shape/topic check. It starts only Mask2Former and 4ch nav_cloning. -->
+  <arg name="script" default="nav_cloning_4ch_node_pytorch_online_mask.py"/>
+  <arg name="dataset_id" default="real_4ch_short_test"/>
+  <arg name="train_steps" default="100"/>
+  <arg name="test_steps" default="0"/>
+  <arg name="auto_stop_test" default="true"/>
+  <arg name="cmd_vel_linear_fixed" default="0.05"/>
+  <arg name="seg_rate_hz" default="2.0"/>
+  <arg name="mmseg_cfg" default="/home/orne_beta/mask2former_project/mmsegmentation/configs/mask2former/mask2former_swin-s_8xb2-160k_ade20k-512x512.py"/>
+  <arg name="mmseg_ckpt" default="/home/orne_beta/mask2former_project/checkpoints/mask2former_swin-s_ade20k.pth"/>
+
+  <param name="/nav_cloning_node/mode" value="change_dataset_balance" type="str"/>
+  <param name="/nav_cloning_node/save_offline_dataset" value="true" type="bool"/>
+  <param name="/nav_cloning_node/save_raw_images" value="true" type="bool"/>
+  <param name="/nav_cloning_node/dataset_id" value="$(arg dataset_id)" type="str"/>
+  <param name="/nav_cloning_node/train_steps" value="$(arg train_steps)" type="int"/>
+  <param name="/nav_cloning_node/test_steps" value="$(arg test_steps)" type="int"/>
+  <param name="/nav_cloning_node/auto_stop_test" value="$(arg auto_stop_test)" type="bool"/>
+  <param name="/nav_cloning_node/cmd_vel_linear_fixed" value="$(arg cmd_vel_linear_fixed)" type="double"/>
+  <param name="/nav_cloning_node/max_mask_age_sec" value="1.5" type="double"/>
+  <param name="/nav_cloning_node/require_fresh_mask" value="true" type="bool"/>
+
+  <node pkg="nav_cloning"
+        type="start_mmseg.sh"
+        name="segmentation_colorserver"
+        args="$(find nav_cloning)/scripts/segmentation_colorserver_real.py"
+        output="screen">
+    <param name="cfg" value="$(arg mmseg_cfg)"/>
+    <param name="ckpt" value="$(arg mmseg_ckpt)"/>
+    <param name="device" value="cuda:0"/>
+    <param name="rate_hz" value="$(arg seg_rate_hz)"/>
+    <param name="save_pred" value="true"/>
+    <param name="save_pred_interval" value="10"/>
+    <param name="ground_names" value="floor,road,sidewalk,path,earth,land,field,sand,grass,runway"/>
+  </node>
+
+  <node pkg="timed_roslaunch" type="timed_roslaunch.sh"
+        args="20 nav_cloning nav_cloning.launch script:=$(arg script)"
+        name="timed_roslaunch_4ch_node_only" output="screen"/>
+</launch>

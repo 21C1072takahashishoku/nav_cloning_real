@@ -1,0 +1,33 @@
+次回4ch実機走行 起動順
+
+[Terminal 1] gamma
+cd ~/shoku_ws
+source /opt/ros/noetic/setup.bash
+source ~/shoku_ws/devel/setup.bash
+roslaunch orne_bringup orne_gamma.launch
+
+[Terminal 2] camera
+cd ~/shoku_ws
+source /opt/ros/noetic/setup.bash
+source ~/shoku_ws/devel/setup.bash
+roslaunch nav_cloning camera_bringup.launch
+
+[Terminal 3] 4ch experiment
+※ conda activate しない
+cd ~/shoku_ws/src/nav_cloning/experiments
+source /opt/ros/noetic/setup.bash
+source ~/shoku_ws/devel/setup.bash
+export ROS_PACKAGE_PATH=$ROS_PACKAGE_PATH:$HOME/shoku_ws/src
+TRAIN_STEPS=300 TEST_STEPS=100 ./experiment_4ch_mask2former_offline_collect.sh real_4ch_short_test
+
+[Terminal 4] check
+cd ~/shoku_ws
+source /opt/ros/noetic/setup.bash
+source ~/shoku_ws/devel/setup.bash
+export ROS_PACKAGE_PATH=$ROS_PACKAGE_PATH:$HOME/shoku_ws/src
+
+rostopic hz /camera_center/usb_cam/image_raw
+rostopic hz /segmentation/ground_mask_center
+rostopic hz /nav_vel
+rostopic echo -n 5 /icart_mini/cmd_vel
+find ~/shoku_ws/src/nav_cloning/data/real_4ch_short_test -type f | tail -50

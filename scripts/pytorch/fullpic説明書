@@ -1,0 +1,602 @@
+## 1. 結論（最適解）
+
+以下をそのまま研究ノート・README用の手順書として使えばよいです。
+目的は、**従来の48×64学習用画像に加えて、セグメンテーション用の元解像度画像480×640も保存すること**です。
+元コードでは、カメラ画像自体は480×640で受信していますが、保存されていたのはリサイズ後の48×64 `.npy` のみでした。
+
+---
+
+# 2. 手順書：元解像度画像保存対応版
+
+## 2.1 背景
+
+これまでの `nav_cloning_node_pytorch_offline_collect.py` では、オフライン学習用データとして以下を保存していた。
+
+```text
+data/<DATASET_ID>/dataset/img/{episode}_center.npy
+data/<DATASET_ID>/dataset/img/{episode}_left.npy
+data/<DATASET_ID>/dataset/img/{episode}_right.npy
+data/<DATASET_ID>/dataset/vel/data.csv
+```
+
+この `.npy` 画像は、保存前に以下の処理で `48×64` に縮小されている。
+
+```python
+img = resize(self.cv_image, (48, 64), mode='constant').astype(np.float32)
+img_left = resize(self.cv_left_image, (48, 64), mode='constant').astype(np.float32)
+img_right = resize(self.cv_right_image, (48, 64), mode='constant').astype(np.float32)
+```
+
+そのため、後からMMSegmentationで地面マスクを作ろうとしても、床・壁・柱の境界情報が潰れており、ほぼ全体が `wall` と誤認識された。
+
+---
+
+## 2.2 今回の変更目的
+
+今回の目的は、**リサイズ前の元画像も同時保存すること**である。
+
+追加保存する画像は以下。
+
+```text
+data/<DATASET_ID>/dataset/raw_img/center/{episode}_center.png
+data/<DATASET_ID>/dataset/raw_img/left/{episode}_left.png
+data/<DATASET_ID>/dataset/raw_img/right/{episode}_right.png
+```
+
+この画像は以下の形式で保存する。
+
+```text
+画像サイズ：480×640×3
+型：uint8
+色順：BGR
+形式：PNG
+用途：後処理セグメンテーション用
+```
+
+小学生向けに言うと、
+
+```text
+今までは小さくつぶした写真だけを保存していた。
+これからは、カメラが見た大きい写真も一緒に保存する。
+```
+
+---
+
+## 2.3 変更後の保存構造
+
+修正後は、1 stepごとに以下が保存される。
+
+```text
+data/<DATASET_ID>/dataset/
+├── img/
+│   ├── 0_center.npy
+│   ├── 0_left.npy
+│   ├── 0_right.npy
+│   └── ...
+│
+├── raw_img/
+│   ├── center/
+│   │   ├── 0_center.png
+│   │   ├── 1_center.png
+│   │   └── ...
+│   ├── left/
+│   │   ├── 0_left.png
+│   │   ├── 1_left.png
+│   │   └── ...
+│   └── right/
+│       ├── 0_right.png
+│       ├── 1_right.png
+│       └── ...
+│
+└── vel/
+    └── data.csv
+```
+
+それぞれの役割は以下。
+
+| 保存先                       | 中身                     | 用途              |
+| ------------------------- | ---------------------- | --------------- |
+| `dataset/img/*.npy`       | 48×64×3                | 従来の3ch学習用       |
+| `dataset/raw_img/*/*.png` | 480×640×3              | MMSegmentation用 |
+| `dataset/vel/data.csv`    | 操舵・pose・distance・phase | 学習ラベル・評価用       |
+
+---
+
+# 3. 変更点と理由
+
+## 3.1 `save_raw_images` パラメータを追加
+
+### 変更内容
+
+```python
+self.save_raw_images = rospy.get_param("/nav_cloning_node/save_raw_images", True)
+```
+
+### 理由
+
+元画像保存をON/OFFできるようにするため。
+
+### 変更しないとどうなるか
+
+常に元画像を保存する設計になり、保存容量や処理負荷を調整できない。
+
+---
+
+## 3.2 raw画像保存用ディレクトリを追加
+
+### 変更内容
+
+```python
+self.raw_img_store_path = os.path.join(self.dataset_base, 'raw_img')
+self.raw_center_store_path = os.path.join(self.raw_img_store_path, 'center')
+self.raw_left_store_path = os.path.join(self.raw_img_store_path, 'left')
+self.raw_right_store_path = os.path.join(self.raw_img_store_path, 'right')
+```
+
+### 理由
+
+従来の `dataset/img/` は48×64の学習用画像で使い続けるため、元画像は別ディレクトリに分ける。
+
+### 変更しないとどうなるか
+
+48×64画像と480×640画像が混在し、後処理や学習コードが壊れる。
+
+---
+
+## 3.3 `_save_raw_images()` を追加
+
+### 変更内容
+
+```python
+def _save_raw_images(self, ep, raw_img, raw_img_left, raw_img_right):
+    if not self.save_raw_images:
+        return
+
+    raw_img = raw_img.copy()
+    raw_img_left = raw_img_left.copy()
+    raw_img_right = raw_img_right.copy()
+
+    cv2.imwrite(
+        os.path.join(self.raw_center_store_path, f"{ep}_center.png"),
+        raw_img
+    )
+    cv2.imwrite(
+        os.path.join(self.raw_left_store_path, f"{ep}_left.png"),
+        raw_img_left
+    )
+    cv2.imwrite(
+        os.path.join(self.raw_right_store_path, f"{ep}_right.png"),
+        raw_img_right
+    )
+```
+
+### 理由
+
+リサイズ前のカメラ画像を、`episode` 番号と対応させて保存するため。
+
+### 変更しないとどうなるか
+
+後から元解像度画像を使って地面マスクを作れない。
+
+---
+
+## 3.4 `_maybe_save_offline_sample()` にraw画像引数を追加
+
+### 変更内容
+
+変更前：
+
+```python
+def _maybe_save_offline_sample(
+    self,
+    img,
+    img_left,
+    img_right,
+    expert_action,
+    distance,
+    executed_action,
+    policy_action,
+    phase
+):
+```
+
+変更後：
+
+```python
+def _maybe_save_offline_sample(
+    self,
+    img,
+    img_left,
+    img_right,
+    raw_img,
+    raw_img_left,
+    raw_img_right,
+    expert_action,
+    distance,
+    executed_action,
+    policy_action,
+    phase
+):
+```
+
+### 理由
+
+縮小済み画像と同じタイミングで、元画像も保存するため。
+
+### 変更しないとどうなるか
+
+`_maybe_save_offline_sample()` の中で元画像を保存できない。
+
+---
+
+## 3.5 `loop()` 内でresize前にraw画像をcopy
+
+### 変更内容
+
+```python
+raw_img = self.cv_image.copy()
+raw_img_left = self.cv_left_image.copy()
+raw_img_right = self.cv_right_image.copy()
+```
+
+### 理由
+
+`self.cv_image` はROS callbackで更新され続けるため、保存処理中に画像が変わる可能性がある。`copy()` しておくことで、そのstep時点の画像を固定できる。
+
+### 変更しないとどうなるか
+
+CSVのepisode番号と画像のタイミングがズレる可能性がある。
+
+---
+
+## 3.6 `_maybe_save_offline_sample()` 呼び出しを修正
+
+### training側
+
+```python
+self._maybe_save_offline_sample(
+    img=img,
+    img_left=img_left,
+    img_right=img_right,
+    raw_img=raw_img,
+    raw_img_left=raw_img_left,
+    raw_img_right=raw_img_right,
+    expert_action=self.action,
+    distance=distance,
+    executed_action=cmd_action,
+    policy_action=policy_action,
+    phase="training",
+)
+```
+
+### test側
+
+```python
+self._maybe_save_offline_sample(
+    img=img,
+    img_left=img_left,
+    img_right=img_right,
+    raw_img=raw_img,
+    raw_img_left=raw_img_left,
+    raw_img_right=raw_img_right,
+    expert_action=expert_action,
+    distance=distance,
+    executed_action=cmd_action,
+    policy_action=policy_action,
+    phase="test",
+)
+```
+
+### 理由
+
+training/testどちらでも、同じ形式で元画像を保存するため。
+
+### 変更しないとどうなるか
+
+training中は保存されるがtest中は保存されない、またはその逆になり、比較データとして不完全になる。
+
+---
+
+# 4. 使い方
+
+## Step 1：修正版ファイルを配置する
+
+修正版を以下に置く。
+
+```bash
+~/shoku_ws/src/nav_cloning/scripts/nav_cloning_node_pytorch_offline_collect.py
+```
+
+実行権限を付ける。
+
+```bash
+chmod +x ~/shoku_ws/src/nav_cloning/scripts/nav_cloning_node_pytorch_offline_collect.py
+```
+
+---
+
+## Step 2：launchまたはrosparamで保存設定を確認する
+
+最低限、以下のパラメータを設定する。
+
+```xml
+<param name="/nav_cloning_node/save_offline_dataset" value="true"/>
+<param name="/nav_cloning_node/save_raw_images" value="true"/>
+<param name="/nav_cloning_node/dataset_id" value="rawtest_001"/>
+<param name="/nav_cloning_node/dataset_stride" value="1"/>
+```
+
+短時間テストでは、容量削減のため以下でもよい。
+
+```xml
+<param name="/nav_cloning_node/dataset_stride" value="5"/>
+```
+
+推奨：
+
+```text
+保存確認テスト：dataset_stride=5
+正式取得：dataset_stride=1
+```
+
+---
+
+## Step 3：短時間テストを行う
+
+最初から1周分を取らない。
+まずは **100〜300step** だけ動かして、保存が成立するか確認する。
+
+目的：
+
+```text
+1. raw_imgが保存されるか確認
+2. 画像枚数とCSV行数が一致するか確認
+3. 画像サイズが480×640か確認
+4. 走行周期が重くならないか確認
+```
+
+---
+
+## Step 4：保存結果を確認する
+
+`DATASET` に取得したデータ名を入れる。
+
+```bash
+cd ~/shoku_ws/src/nav_cloning
+DATASET=rawtest_001
+```
+
+枚数確認：
+
+```bash
+echo "resized center npy:"
+ls data/$DATASET/dataset/img/*_center.npy | wc -l
+
+echo "resized left npy:"
+ls data/$DATASET/dataset/img/*_left.npy | wc -l
+
+echo "resized right npy:"
+ls data/$DATASET/dataset/img/*_right.npy | wc -l
+
+echo "raw center png:"
+ls data/$DATASET/dataset/raw_img/center/*_center.png | wc -l
+
+echo "raw left png:"
+ls data/$DATASET/dataset/raw_img/left/*_left.png | wc -l
+
+echo "raw right png:"
+ls data/$DATASET/dataset/raw_img/right/*_right.png | wc -l
+
+echo "csv rows:"
+tail -n +2 data/$DATASET/dataset/vel/data.csv | wc -l
+```
+
+成功条件：
+
+```text
+center npy数 = left npy数 = right npy数
+raw center png数 = raw left png数 = raw right png数
+CSV行数と画像数が一致
+```
+
+---
+
+## Step 5：画像shapeを確認する
+
+```bash
+python3 - << 'EOF'
+import os
+import cv2
+import numpy as np
+
+dataset = "rawtest_001"
+base = os.path.expanduser(f"~/shoku_ws/src/nav_cloning/data/{dataset}/dataset")
+
+paths = [
+    os.path.join(base, "img", "0_center.npy"),
+    os.path.join(base, "raw_img", "center", "0_center.png"),
+    os.path.join(base, "raw_img", "left", "0_left.png"),
+    os.path.join(base, "raw_img", "right", "0_right.png"),
+]
+
+for p in paths:
+    if p.endswith(".npy"):
+        x = np.load(p)
+        print(p, x.shape, x.dtype, x.min(), x.max())
+    else:
+        x = cv2.imread(p)
+        print(p, None if x is None else x.shape)
+EOF
+```
+
+期待値：
+
+```text
+0_center.npy        (48, 64, 3) float32
+0_center.png        (480, 640, 3)
+0_left.png          (480, 640, 3)
+0_right.png         (480, 640, 3)
+```
+
+---
+
+## Step 6：raw画像でセグメンテーションを試す
+
+例として `1170_center.png` がある場合：
+
+```bash
+cd ~/shoku_ws/src/nav_cloning
+PY=/home/orne_beta/.pyenv/versions/mmseg310/bin/python
+
+PYTHONNOUSERSITE=1 $PY tools/make_ground_mask_mmseg.py \
+  --dataset rawtest_001 \
+  --step 1170 \
+  --cam center \
+  --input data/rawtest_001/dataset/raw_img/center/1170_center.png
+```
+
+短時間テストなら、まず `0_center.png` でよい。
+
+```bash
+PYTHONNOUSERSITE=1 $PY tools/make_ground_mask_mmseg.py \
+  --dataset rawtest_001 \
+  --step 0 \
+  --cam center \
+  --input data/rawtest_001/dataset/raw_img/center/0_center.png
+```
+
+確認：
+
+```bash
+xdg-open data/rawtest_001/seg_vis
+```
+
+見るもの：
+
+```text
+0_center_input.png
+0_center_ground_mask.png
+0_center_overlay.png
+```
+
+判定：
+
+```text
+白/緑 = 地面
+黒 = 地面以外
+```
+
+---
+
+# 5. 注意点
+
+## 5.1 容量が増える
+
+480×640 PNGを3カメラ分、毎step保存するため、容量が増える。
+
+目安：
+
+```text
+1周2500step × 3カメラ = 7500枚PNG
+```
+
+対策：
+
+```text
+短時間テスト：dataset_stride=5
+正式取得：dataset_stride=1
+不要になった失敗データは削除
+```
+
+---
+
+## 5.2 保存処理が重くなる可能性がある
+
+PNG保存は `.npy` 保存より重い。
+
+対策：
+
+```text
+まず100〜300stepで試す
+走行周期が乱れないか確認する
+問題があればdataset_strideを2または5にする
+```
+
+---
+
+## 5.3 BGR/RGBに注意
+
+ROSの画像は `cv_bridge` により `bgr8` で取得している。
+そのため、raw PNGはOpenCV形式のBGRとして保存される。
+
+```text
+cv2.imwrite：BGRのまま保存
+cv2.imread：BGRで読み込み
+MMSegに渡す時：プログラム側で色順を統一する
+```
+
+---
+
+# 6. 研究ノート記録テンプレート
+
+```text
+# 元解像度画像保存対応テスト
+
+日付：
+データセット名：
+使用ノード：
+保存設定：
+  save_offline_dataset：
+  save_raw_images：
+  dataset_stride：
+  train_steps：
+  test_steps：
+
+## 保存確認
+resized center npy：
+resized left npy：
+resized right npy：
+raw center png：
+raw left png：
+raw right png：
+csv rows：
+
+## shape確認
+0_center.npy：
+0_center.png：
+0_left.png：
+0_right.png：
+
+## セグメンテーション確認
+入力画像：
+モデル：
+ground_ratio：
+mask unique：
+結果：
+  地面が取れた / 取れない
+  壁を誤認した / していない
+  使用可能 / 不可
+
+## 判断
+正式取得に進むか：
+修正が必要な点：
+```
+
+---
+
+## 7. 最終判断
+
+今回の修正後にやるべき順番はこれ。
+
+```text
+1. raw画像保存対応コードに差し替え
+2. dataset_stride=5で短時間テスト
+3. raw_imgとCSVの枚数一致を確認
+4. raw画像が480×640で保存されているか確認
+5. raw画像でMMSegmentationを試す
+6. 地面マスクが出るなら、1周分を再取得
+7. その後、正式に4chデータセット作成へ進む
+```
+
+この手順で、**「3ch画像だけ取れているが4ch化できない」状態から、「元画像→地面マスク→4ch入力」まで再現可能なデータ取得手順**に変わります。
+
